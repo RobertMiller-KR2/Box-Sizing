@@ -174,8 +174,157 @@ export default function App() {
   const [padding, setPadding] = useState(1);
   const [items, setItems] = useState([]);
   const [draft, setDraft] = useState({ name: "Item 1", pxLength: 600, pxWidth: 350, height: 3 });
+  const [measureMode, setMeasureMode] = useState("template");
+  const [tapPoints, setTapPoints] = useState({ template: [], length: [], width: [] });
+  const [detectionResult, setDetectionResult] = useState("");
 
   const scale = referencePixels > 0 ? referenceInches / referencePixels : 0;
+
+  function distance(p1, p2) {
+    if (!p1 || !p2) return 0;
+    return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+  }
+
+  function handlePhotoTap(e) {
+    if (!photo) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const point = { x, y };
+
+    setTapPoints((prev) => {
+      const current = prev[measureMode] || [];
+      const updatedModePoints = current.length >= 2 ? [point] : [...current, point];
+      const next = { ...prev, [measureMode]: updatedModePoints };
+
+      if (updatedModePoints.length === 2) {
+        const px = distance(updatedModePoints[0], updatedModePoints[1]);
+        if (measureMode === "template") {
+          setReferencePixels(+px.toFixed(0));
+          setMeasureMode("length");
+        }
+        if (measureMode === "length") {
+          setDraft((d) => ({ ...d, pxLength: +px.toFixed(0) }));
+          setMeasureMode("width");
+        }
+        if (measureMode === "width") {
+          setDraft((d) => ({ ...d, pxWidth: +px.toFixed(0) }));
+        }
+      }
+
+      return next;
+    });
+  }
+
+  function clearTapMeasurements() {
+    setTapPoints({ template: [], length: [], width: [] });
+    setMeasureMode("template");
+  }
+
+  function getModeLabel() {
+    if (measureMode === "template") return "Tap the LEFT and RIGHT edges of the 8.5 inch template width";
+    if (measureMode === "length") return "Tap both ends of the item LENGTH";
+    return "Tap both sides of the item WIDTH";
+  }
+
+  function autoDetectItem() {
+    if (!photo) return;
+
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      const { width, height } = canvas;
+      const data = ctx.getImageData(0, 0, width, height).data;
+
+      let minBlackX = width;
+      let minBlackY = height;
+      let maxBlackX = 0;
+      let maxBlackY = 0;
+
+      for (let y = 0; y < height; y += 3) {
+        for (let x = 0; x < width; x += 3) {
+          const i = (y * width + x) * 4;
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          if (r < 70 && g < 70 && b < 70) {
+            minBlackX = Math.min(minBlackX, x);
+            minBlackY = Math.min(minBlackY, y);
+            maxBlackX = Math.max(maxBlackX, x);
+            maxBlackY = Math.max(maxBlackY, y);
+          }
+        }
+      }
+
+      const templateW = maxBlackX - minBlackX;
+      const templateH = maxBlackY - minBlackY;
+
+      if (templateW < width * 0.25 || templateH < height * 0.25) {
+        setDetectionResult("Could not detect the printed template. Move closer, improve lighting, and keep the full template visible.");
+        return;
+      }
+
+      setReferenceInches(8.5);
+      setReferencePixels(Math.round(templateW));
+
+      const roiX1 = Math.round(minBlackX + templateW * 0.17);
+      const roiX2 = Math.round(minBlackX + templateW * 0.83);
+      const roiY1 = Math.round(minBlackY + templateH * 0.18);
+      const roiY2 = Math.round(minBlackY + templateH * 0.77);
+
+      let minItemX = width;
+      let minItemY = height;
+      let maxItemX = 0;
+      let maxItemY = 0;
+      let count = 0;
+
+      for (let y = roiY1; y < roiY2; y += 2) {
+        for (let x = roiX1; x < roiX2; x += 2) {
+          const i = (y * width + x) * 4;
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const max = Math.max(r, g, b);
+          const min = Math.min(r, g, b);
+          const saturation = max - min;
+          const brightness = (r + g + b) / 3;
+
+          // Ignore white paper and light gray grid lines. Keep colored or darker item pixels.
+          const looksLikeItem = (saturation > 32 && brightness < 245) || brightness < 145;
+
+          if (looksLikeItem) {
+            minItemX = Math.min(minItemX, x);
+            minItemY = Math.min(minItemY, y);
+            maxItemX = Math.max(maxItemX, x);
+            maxItemY = Math.max(maxItemY, y);
+            count++;
+          }
+        }
+      }
+
+      if (count < 80) {
+        setDetectionResult("Template found, but no item was detected. Use a solid background item, avoid clear/white objects, and keep it inside the dashed area.");
+        return;
+      }
+
+      const itemPxLength = Math.max(maxItemX - minItemX, maxItemY - minItemY);
+      const itemPxWidth = Math.min(maxItemX - minItemX, maxItemY - minItemY);
+
+      setDraft((d) => ({
+        ...d,
+        pxLength: Math.round(itemPxLength),
+        pxWidth: Math.round(itemPxWidth),
+      }));
+
+      setDetectionResult(`Detected item: ${Math.round(itemPxLength)} px x ${Math.round(itemPxWidth)} px. Enter height, then click Add Item.`);
+    };
+
+    img.src = photo;
+  }
 
   const measuredDraft = useMemo(() => ({
     name: draft.name,
@@ -226,6 +375,7 @@ export default function App() {
     setPhoto(null);
     setItems([]);
     setDraft({ name: "Item 1", pxLength: 600, pxWidth: 350, height: 3 });
+    clearTapMeasurements();
   }
 
   useEffect(() => () => stopCamera(), []);
@@ -249,13 +399,48 @@ export default function App() {
           <Card>
             <CardContent style={{ display: "grid", gap: "12px" }}>
               <h2 style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "20px", margin: 0 }}><Camera size={20} />Photo</h2>
-              <div style={{ aspectRatio: "16 / 9", overflow: "hidden", borderRadius: "20px", background: "#000000" }}>
+              <div style={{ aspectRatio: "16 / 9", overflow: "hidden", borderRadius: "20px", background: "#000000", position: "relative" }} onClick={handlePhotoTap}>
                 {photo ? (
-                  <img src={photo} alt="Captured items" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                  <>
+                    <img src={photo} alt="Captured items" style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }} />
+                    {Object.entries(tapPoints).flatMap(([mode, points]) =>
+                      points.map((p, idx) => (
+                        <div
+                          key={`${mode}-${idx}`}
+                          style={{
+                            position: "absolute",
+                            left: p.x - 7,
+                            top: p.y - 7,
+                            width: 14,
+                            height: 14,
+                            borderRadius: "50%",
+                            background: mode === "template" ? "#22c55e" : mode === "length" ? "#2563eb" : "#f97316",
+                            border: "2px solid white",
+                            boxShadow: "0 1px 4px rgba(0,0,0,0.4)",
+                          }}
+                        />
+                      ))
+                    )}
+                  </>
                 ) : (
                   <video ref={videoRef} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: "contain" }} />
                 )}
               </div>
+              {photo && (
+                <div style={{ display: "grid", gap: "8px", background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: "14px", padding: "12px" }}>
+                  <b>Tap-to-measure</b>
+                  <span style={{ fontSize: "14px" }}>{getModeLabel()}</span>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <Button variant={measureMode === "template" ? "solid" : "outline"} onClick={() => setMeasureMode("template")}>Template</Button>
+                    <Button variant={measureMode === "length" ? "solid" : "outline"} onClick={() => setMeasureMode("length")}>Length</Button>
+                    <Button variant={measureMode === "width" ? "solid" : "outline"} onClick={() => setMeasureMode("width")}>Width</Button>
+                    <Button variant="outline" onClick={clearTapMeasurements}>Clear Taps</Button>
+                    <Button onClick={autoDetectItem}>Auto Detect Item</Button>
+                  </div>
+                  <span style={{ fontSize: "12px", color: "#475569" }}>Tip: use Auto Detect first. If it misses, use tap-to-measure as a backup.</span>
+                  {detectionResult && <span style={{ fontSize: "13px", color: "#0f172a", fontWeight: 600 }}>{detectionResult}</span>
+                </div>
+              )}
               <canvas ref={canvasRef} style={{ display: "none" }} />
               <p style={{ fontSize: "12px", color: "#64748b", margin: 0 }}>Best results: print the template at 100%, place items flat inside the dashed box, and keep the phone camera parallel to the page.</p>
             </CardContent>
