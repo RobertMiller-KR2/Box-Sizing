@@ -438,7 +438,7 @@ export default function App() {
                     <Button onClick={autoDetectItem}>Auto Detect Item</Button>
                   </div>
                   <span style={{ fontSize: "12px", color: "#475569" }}>Tip: use Auto Detect first. If it misses, use tap-to-measure as a backup.</span>
-                  {detectionResult && <span style={{ fontSize: "13px", color: "#0f172a", fontWeight: 600 }}>{detectionResult}</span>
+                  {detectionResult && <span style={{ fontSize: "13px", color: "#0f172a", fontWeight: 600 }}>{detectionResult}</span>}
                 </div>
               )}
               <canvas ref={canvasRef} style={{ display: "none" }} />
