@@ -177,7 +177,7 @@ export default function App() {
   const [measureMode, setMeasureMode] = useState("template");
   const [tapPoints, setTapPoints] = useState({ template: [], length: [], width: [] });
   const [detectionResult, setDetectionResult] = useState("");
-  const [opencvReady, setOpencvReady] = useState(false);
+  const [opencvReady, set
 
   const scale = referencePixels > 0 ? referenceInches / referencePixels : 0;
 
