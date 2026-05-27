@@ -177,7 +177,8 @@ export default function App() {
   const [measureMode, setMeasureMode] = useState("template");
   const [tapPoints, setTapPoints] = useState({ template: [], length: [], width: [] });
   const [detectionResult, setDetectionResult] = useState("");
-  const [opencvReady, set
+  const [opencvReady, setOpencvReady] = useState(false);
+  const [emptyTemplateImage, setEmptyTemplateImage] = useState(() => localStorage.getItem("boxSizingEmptyTemplate") || "");
 
   const scale = referencePixels > 0 ? referenceInches / referencePixels : 0;
 
@@ -272,8 +273,224 @@ export default function App() {
     return [tl, tr, br, bl];
   }
 
+  function saveEmptyTemplate() {
+    if (!photo) {
+      setDetectionResult("Capture a clear photo of the EMPTY template first.");
+      return;
+    }
+    localStorage.setItem("boxSizingEmptyTemplate", photo);
+    setEmptyTemplateImage(photo);
+    setDetectionResult("Empty template saved on this device. Now place the item, capture a product photo, and tap Auto Detect Item.");
+  }
+
+  function clearEmptyTemplate() {
+    localStorage.removeItem("boxSizingEmptyTemplate");
+    setEmptyTemplateImage("");
+    setDetectionResult("Saved empty template was cleared.");
+  }
+
+  function detectAndWarpTemplateFromCanvas(srcCanvas) {
+    const cv = getOpenCv();
+    let src;
+    let gray;
+    let blur;
+    let edges;
+    let contours;
+    let hierarchy;
+    let warped;
+    let M;
+    let dsize;
+    let srcTri;
+    let dstTri;
+
+    try {
+      src = cv.imread(srcCanvas);
+      gray = new cv.Mat();
+      blur = new cv.Mat();
+      edges = new cv.Mat();
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
+
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+      cv.Canny(blur, edges, 50, 150);
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      let bestQuad = null;
+      let bestArea = 0;
+
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const peri = cv.arcLength(cnt, true);
+        const approx = new cv.Mat();
+        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+        const area = Math.abs(cv.contourArea(approx));
+
+        if (approx.rows === 4 && area > bestArea) {
+          const rect = cv.boundingRect(approx);
+          const aspect = rect.width / rect.height;
+          if (aspect > 0.55 && aspect < 0.95 && area > src.cols * src.rows * 0.1) {
+            bestArea = area;
+            bestQuad = [];
+            for (let j = 0; j < 4; j++) {
+              bestQuad.push({ x: approx.intPtr(j, 0)[0], y: approx.intPtr(j, 0)[1] });
+            }
+          }
+        }
+        approx.delete();
+        cnt.delete();
+      }
+
+      if (!bestQuad) return null;
+
+      const [tl, tr, br, bl] = orderCorners(bestQuad);
+      const outputW = 850;
+      const outputH = 1100;
+      dsize = new cv.Size(outputW, outputH);
+      srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+      dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, outputW, 0, outputW, outputH, 0, outputH]);
+      M = cv.getPerspectiveTransform(srcTri, dstTri);
+      warped = new cv.Mat();
+      cv.warpPerspective(src, warped, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+      return warped;
+    } finally {
+      [src, gray, blur, edges, contours, hierarchy, M, srcTri, dstTri].forEach((m) => {
+        if (m && typeof m.delete === "function") m.delete();
+      });
+    }
+  }
+
+  async function dataUrlToCanvas(dataUrl) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas);
+      };
+      img.src = dataUrl;
+    });
+  }
+
+  async function autoDetectItemWithStoredTemplate() {
+    if (!photo) return;
+    if (!emptyTemplateImage) {
+      setDetectionResult("No saved empty template. Capture the EMPTY template first, then tap Save Empty Template.");
+      return;
+    }
+
+    const cv = getOpenCv();
+    if (!cv) {
+      loadOpenCv();
+      return;
+    }
+
+    let emptyWarp;
+    let productWarp;
+    let emptyGray;
+    let productGray;
+    let diff;
+    let thresh;
+    let contours;
+    let hierarchy;
+
+    try {
+      const emptyCanvas = await dataUrlToCanvas(emptyTemplateImage);
+      const productCanvas = await dataUrlToCanvas(photo);
+      emptyWarp = detectAndWarpTemplateFromCanvas(emptyCanvas);
+      productWarp = detectAndWarpTemplateFromCanvas(productCanvas);
+
+      if (!emptyWarp || !productWarp) {
+        setDetectionResult("Could not find template marks in one of the images. Keep the full template visible in both photos.");
+        return;
+      }
+
+      emptyGray = new cv.Mat();
+      productGray = new cv.Mat();
+      diff = new cv.Mat();
+      thresh = new cv.Mat();
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
+
+      cv.cvtColor(emptyWarp, emptyGray, cv.COLOR_RGBA2GRAY);
+      cv.cvtColor(productWarp, productGray, cv.COLOR_RGBA2GRAY);
+      cv.absdiff(emptyGray, productGray, diff);
+
+      // Only inspect inside dashed placement area, away from border/printed marks.
+      const roiMargin = 45;
+      const roiX = 125 + roiMargin;
+      const roiY = 175 + roiMargin;
+      const roiW = 600 - roiMargin * 2;
+      const roiH = 700 - roiMargin * 2;
+      const roi = diff.roi(new cv.Rect(roiX, roiY, roiW, roiH));
+
+      cv.threshold(roi, thresh, 22, 255, cv.THRESH_BINARY);
+      const kernel = cv.Mat.ones(9, 9, cv.CV_8U);
+      cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel);
+      cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel);
+      kernel.delete();
+
+      cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      let minX = roiW;
+      let minY = roiH;
+      let maxX = 0;
+      let maxY = 0;
+      let foundArea = 0;
+
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const area = Math.abs(cv.contourArea(cnt));
+        const rect = cv.boundingRect(cnt);
+        const touchesEdge = rect.x <= 3 || rect.y <= 3 || rect.x + rect.width >= roiW - 3 || rect.y + rect.height >= roiH - 3;
+
+        if (!touchesEdge && area > 500) {
+          minX = Math.min(minX, rect.x);
+          minY = Math.min(minY, rect.y);
+          maxX = Math.max(maxX, rect.x + rect.width);
+          maxY = Math.max(maxY, rect.y + rect.height);
+          foundArea += area;
+        }
+        cnt.delete();
+      }
+
+      roi.delete();
+
+      if (foundArea < 500) {
+        setDetectionResult("No product change detected. Make sure the saved empty template matches this template and lighting is similar.");
+        return;
+      }
+
+      const itemPxLength = Math.max(maxX - minX, maxY - minY);
+      const itemPxWidth = Math.min(maxX - minX, maxY - minY);
+      const pixelsPerInch = 850 / 8.5;
+      const itemLengthIn = itemPxLength / pixelsPerInch;
+      const itemWidthIn = itemPxWidth / pixelsPerInch;
+
+      setReferenceInches(8.5);
+      setReferencePixels(850);
+      setDraft((d) => ({ ...d, pxLength: Math.round(itemPxLength), pxWidth: Math.round(itemPxWidth) }));
+      setDetectionResult(`Background-subtracted size: ${itemLengthIn.toFixed(2)} in x ${itemWidthIn.toFixed(2)} in. Enter height, then Add Item.`);
+    } catch (err) {
+      console.error(err);
+      setDetectionResult("Stored-template detection failed. Retake the empty template photo and try again.");
+    } finally {
+      [emptyWarp, productWarp, emptyGray, productGray, diff, thresh, contours, hierarchy].forEach((m) => {
+        if (m && typeof m.delete === "function") m.delete();
+      });
+    }
+  }
+
   function autoDetectItem() {
     if (!photo) return;
+
+    if (emptyTemplateImage) {
+      autoDetectItemWithStoredTemplate();
+      return;
+    }
 
     const cv = getOpenCv();
     if (!cv) {
@@ -557,9 +774,11 @@ export default function App() {
                     <Button variant={measureMode === "length" ? "solid" : "outline"} onClick={() => setMeasureMode("length")}>Length</Button>
                     <Button variant={measureMode === "width" ? "solid" : "outline"} onClick={() => setMeasureMode("width")}>Width</Button>
                     <Button variant="outline" onClick={clearTapMeasurements}>Clear Taps</Button>
+                    <Button onClick={saveEmptyTemplate}>Save Empty Template</Button>
+                    <Button variant="outline" onClick={clearEmptyTemplate}>Clear Empty Template</Button>
                     <Button onClick={autoDetectItem}>Auto Detect Item</Button>
                   </div>
-                  <span style={{ fontSize: "12px", color: "#475569" }}>Tip: use Auto Detect first. If it misses, use tap-to-measure as a backup.</span>
+                  <span style={{ fontSize: "12px", color: "#475569" }}>Saved template: <b>{emptyTemplateImage ? "Yes" : "No"}</b>. Best workflow: capture empty template once, save it, then capture product photos and auto detect.</span>
                   {detectionResult && <span style={{ fontSize: "13px", color: "#0f172a", fontWeight: 600 }}>{detectionResult}</span>}
                 </div>
               )}
