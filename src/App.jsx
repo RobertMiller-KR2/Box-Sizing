@@ -177,6 +177,7 @@ export default function App() {
   const [measureMode, setMeasureMode] = useState("template");
   const [tapPoints, setTapPoints] = useState({ template: [], length: [], width: [] });
   const [detectionResult, setDetectionResult] = useState("");
+  const [opencvReady, setOpencvReady] = useState(false);
 
   const scale = referencePixels > 0 ? referenceInches / referencePixels : 0;
 
@@ -227,100 +228,204 @@ export default function App() {
     return "Tap both sides of the item WIDTH";
   }
 
+  function getOpenCv() {
+    return window.cv && window.cv.Mat ? window.cv : null;
+  }
+
+  function loadOpenCv() {
+    if (getOpenCv()) {
+      setOpencvReady(true);
+      setDetectionResult("OpenCV is ready.");
+      return;
+    }
+
+    if (document.getElementById("opencv-js")) {
+      setDetectionResult("OpenCV is loading. Try Auto Detect again in a few seconds.");
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = "opencv-js";
+    script.async = true;
+    script.src = "https://docs.opencv.org/4.x/opencv.js";
+    script.onload = () => {
+      const waitForCv = setInterval(() => {
+        if (getOpenCv()) {
+          clearInterval(waitForCv);
+          setOpencvReady(true);
+          setDetectionResult("OpenCV is ready. Capture a photo and tap Auto Detect Item.");
+        }
+      }, 250);
+    };
+    script.onerror = () => setDetectionResult("OpenCV failed to load. Check internet connection or use tap-to-measure backup.");
+    document.body.appendChild(script);
+    setDetectionResult("Loading OpenCV. This can take a few seconds on first load.");
+  }
+
+  function orderCorners(points) {
+    const sorted = [...points].sort((a, b) => a.x + a.y - (b.x + b.y));
+    const tl = sorted[0];
+    const br = sorted[sorted.length - 1];
+    const middle = sorted.slice(1, -1).sort((a, b) => a.x - a.y - (b.x - b.y));
+    const bl = middle[0];
+    const tr = middle[middle.length - 1];
+    return [tl, tr, br, bl];
+  }
+
   function autoDetectItem() {
     if (!photo) return;
 
+    const cv = getOpenCv();
+    if (!cv) {
+      loadOpenCv();
+      return;
+    }
+
     const img = new Image();
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0);
-      const { width, height } = canvas;
-      const data = ctx.getImageData(0, 0, width, height).data;
+      const srcCanvas = document.createElement("canvas");
+      srcCanvas.width = img.naturalWidth;
+      srcCanvas.height = img.naturalHeight;
+      const srcCtx = srcCanvas.getContext("2d", { willReadFrequently: true });
+      srcCtx.drawImage(img, 0, 0);
 
-      let minBlackX = width;
-      let minBlackY = height;
-      let maxBlackX = 0;
-      let maxBlackY = 0;
+      let src;
+      let gray;
+      let blur;
+      let edges;
+      let contours;
+      let hierarchy;
+      let warped;
+      let warpedGray;
+      let thresh;
+      let itemContours;
+      let itemHierarchy;
+      let M;
+      let dsize;
+      let srcTri;
+      let dstTri;
 
-      for (let y = 0; y < height; y += 3) {
-        for (let x = 0; x < width; x += 3) {
-          const i = (y * width + x) * 4;
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-          if (r < 70 && g < 70 && b < 70) {
-            minBlackX = Math.min(minBlackX, x);
-            minBlackY = Math.min(minBlackY, y);
-            maxBlackX = Math.max(maxBlackX, x);
-            maxBlackY = Math.max(maxBlackY, y);
+      try {
+        src = cv.imread(srcCanvas);
+        gray = new cv.Mat();
+        blur = new cv.Mat();
+        edges = new cv.Mat();
+        contours = new cv.MatVector();
+        hierarchy = new cv.Mat();
+
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+        cv.Canny(blur, edges, 50, 150);
+        cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        let bestQuad = null;
+        let bestArea = 0;
+
+        for (let i = 0; i < contours.size(); i++) {
+          const cnt = contours.get(i);
+          const peri = cv.arcLength(cnt, true);
+          const approx = new cv.Mat();
+          cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+          const area = Math.abs(cv.contourArea(approx));
+
+          if (approx.rows === 4 && area > bestArea) {
+            const rect = cv.boundingRect(approx);
+            const aspect = rect.width / rect.height;
+            if (aspect > 0.55 && aspect < 0.95 && area > src.cols * src.rows * 0.1) {
+              bestArea = area;
+              bestQuad = [];
+              for (let j = 0; j < 4; j++) {
+                bestQuad.push({ x: approx.intPtr(j, 0)[0], y: approx.intPtr(j, 0)[1] });
+              }
+            }
           }
+          approx.delete();
+          cnt.delete();
         }
-      }
 
-      const templateW = maxBlackX - minBlackX;
-      const templateH = maxBlackY - minBlackY;
+        if (!bestQuad) {
+          setDetectionResult("OpenCV could not find the full template border. Keep all 4 page corners visible, improve lighting, and avoid shadows.");
+          return;
+        }
 
-      if (templateW < width * 0.25 || templateH < height * 0.25) {
-        setDetectionResult("Could not detect the printed template. Move closer, improve lighting, and keep the full template visible.");
-        return;
-      }
+        const [tl, tr, br, bl] = orderCorners(bestQuad);
+        const outputW = 850;
+        const outputH = 1100;
+        dsize = new cv.Size(outputW, outputH);
+        srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+        dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, outputW, 0, outputW, outputH, 0, outputH]);
+        M = cv.getPerspectiveTransform(srcTri, dstTri);
+        warped = new cv.Mat();
+        cv.warpPerspective(src, warped, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
 
-      setReferenceInches(8.5);
-      setReferencePixels(Math.round(templateW));
+        warpedGray = new cv.Mat();
+        thresh = new cv.Mat();
+        itemContours = new cv.MatVector();
+        itemHierarchy = new cv.Mat();
 
-      const roiX1 = Math.round(minBlackX + templateW * 0.17);
-      const roiX2 = Math.round(minBlackX + templateW * 0.83);
-      const roiY1 = Math.round(minBlackY + templateH * 0.18);
-      const roiY2 = Math.round(minBlackY + templateH * 0.77);
+        cv.cvtColor(warped, warpedGray, cv.COLOR_RGBA2GRAY);
 
-      let minItemX = width;
-      let minItemY = height;
-      let maxItemX = 0;
-      let maxItemY = 0;
-      let count = 0;
+        // Crop to inner placement area from the printable template.
+        const roiX = 125;
+        const roiY = 175;
+        const roiW = 600;
+        const roiH = 700;
+        const roi = warpedGray.roi(new cv.Rect(roiX, roiY, roiW, roiH));
 
-      for (let y = roiY1; y < roiY2; y += 2) {
-        for (let x = roiX1; x < roiX2; x += 2) {
-          const i = (y * width + x) * 4;
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-          const max = Math.max(r, g, b);
-          const min = Math.min(r, g, b);
-          const saturation = max - min;
-          const brightness = (r + g + b) / 3;
+        // Threshold darker objects against white template paper.
+        cv.threshold(roi, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
-          // Ignore white paper and light gray grid lines. Keep colored or darker item pixels.
-          const looksLikeItem = (saturation > 32 && brightness < 245) || brightness < 145;
+        const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
+        cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel);
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel);
+        kernel.delete();
 
-          if (looksLikeItem) {
-            minItemX = Math.min(minItemX, x);
-            minItemY = Math.min(minItemY, y);
-            maxItemX = Math.max(maxItemX, x);
-            maxItemY = Math.max(maxItemY, y);
-            count++;
+        cv.findContours(thresh, itemContours, itemHierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        let bestItemRect = null;
+        let bestItemArea = 0;
+
+        for (let i = 0; i < itemContours.size(); i++) {
+          const cnt = itemContours.get(i);
+          const area = Math.abs(cv.contourArea(cnt));
+          const rect = cv.boundingRect(cnt);
+
+          // Ignore dashed guide lines/grid noise and tiny specks.
+          if (area > bestItemArea && area > 1200 && rect.width > 25 && rect.height > 25) {
+            bestItemArea = area;
+            bestItemRect = rect;
           }
+          cnt.delete();
         }
+
+        roi.delete();
+
+        if (!bestItemRect) {
+          setDetectionResult("Template corrected, but no item contour was found. Try a non-white item, reduce shadows, and keep the item away from dashed border lines.");
+          return;
+        }
+
+        const pixelsPerInch = outputW / 8.5;
+        const itemLengthIn = Math.max(bestItemRect.width, bestItemRect.height) / pixelsPerInch;
+        const itemWidthIn = Math.min(bestItemRect.width, bestItemRect.height) / pixelsPerInch;
+
+        setReferenceInches(8.5);
+        setReferencePixels(outputW);
+        setDraft((d) => ({
+          ...d,
+          pxLength: Math.round(Math.max(bestItemRect.width, bestItemRect.height)),
+          pxWidth: Math.round(Math.min(bestItemRect.width, bestItemRect.height)),
+        }));
+
+        setDetectionResult(`Detected corrected size: ${itemLengthIn.toFixed(2)} in x ${itemWidthIn.toFixed(2)} in. Enter height, then Add Item.`);
+      } catch (err) {
+        console.error(err);
+        setDetectionResult("Auto detect failed. Use tap-to-measure backup or retake the photo with better lighting.");
+      } finally {
+        [src, gray, blur, edges, contours, hierarchy, warped, warpedGray, thresh, itemContours, itemHierarchy, M, srcTri, dstTri].forEach((m) => {
+          if (m && typeof m.delete === "function") m.delete();
+        });
       }
-
-      if (count < 80) {
-        setDetectionResult("Template found, but no item was detected. Use a solid background item, avoid clear/white objects, and keep it inside the dashed area.");
-        return;
-      }
-
-      const itemPxLength = Math.max(maxItemX - minItemX, maxItemY - minItemY);
-      const itemPxWidth = Math.min(maxItemX - minItemX, maxItemY - minItemY);
-
-      setDraft((d) => ({
-        ...d,
-        pxLength: Math.round(itemPxLength),
-        pxWidth: Math.round(itemPxWidth),
-      }));
-
-      setDetectionResult(`Detected item: ${Math.round(itemPxLength)} px x ${Math.round(itemPxWidth)} px. Enter height, then click Add Item.`);
     };
 
     img.src = photo;
