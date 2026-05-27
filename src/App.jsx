@@ -365,11 +365,13 @@ export default function App() {
 
         cv.cvtColor(warped, warpedGray, cv.COLOR_RGBA2GRAY);
 
-        // Crop to inner placement area from the printable template.
-        const roiX = 125;
-        const roiY = 175;
-        const roiW = 600;
-        const roiH = 700;
+        // Crop INSIDE the dashed placement area, not on the dashed border itself.
+        // The previous version included the dashed rectangle/background and could measure that instead of the item.
+        const roiMargin = 45;
+        const roiX = 125 + roiMargin;
+        const roiY = 175 + roiMargin;
+        const roiW = 600 - roiMargin * 2;
+        const roiH = 700 - roiMargin * 2;
         const roi = warpedGray.roi(new cv.Rect(roiX, roiY, roiW, roiH));
 
         // Threshold darker objects against white template paper.
@@ -390,8 +392,23 @@ export default function App() {
           const area = Math.abs(cv.contourArea(cnt));
           const rect = cv.boundingRect(cnt);
 
-          // Ignore dashed guide lines/grid noise and tiny specks.
-          if (area > bestItemArea && area > 1200 && rect.width > 25 && rect.height > 25) {
+          // Ignore dashed guide lines, grid noise, shadows, and anything touching the crop edge.
+          const touchesEdge = rect.x <= 4 || rect.y <= 4 || rect.x + rect.width >= roiW - 4 || rect.y + rect.height >= roiH - 4;
+          const rectArea = rect.width * rect.height;
+          const fillRatio = rectArea > 0 ? area / rectArea : 0;
+          const aspectRatio = Math.max(rect.width, rect.height) / Math.max(1, Math.min(rect.width, rect.height));
+          const tooThinLikeLine = aspectRatio > 10 || fillRatio < 0.08;
+          const tooLargeLikeBackground = rectArea > roiW * roiH * 0.82;
+
+          if (
+            !touchesEdge &&
+            !tooThinLikeLine &&
+            !tooLargeLikeBackground &&
+            area > bestItemArea &&
+            area > 1200 &&
+            rect.width > 25 &&
+            rect.height > 25
+          ) {
             bestItemArea = area;
             bestItemRect = rect;
           }
@@ -401,7 +418,7 @@ export default function App() {
         roi.delete();
 
         if (!bestItemRect) {
-          setDetectionResult("Template corrected, but no item contour was found. Try a non-white item, reduce shadows, and keep the item away from dashed border lines.");
+          setDetectionResult("Template corrected, but no item contour was found. Move the item toward the center, avoid white/clear items, reduce shadows, and keep it away from the dashed border.");
           return;
         }
 
